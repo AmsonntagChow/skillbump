@@ -31,6 +31,7 @@ MAX_ARCHIVE_MEMBER_BYTES = 100 * 1024 * 1024
 MAX_ARCHIVE_TOTAL_BYTES = 512 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 100 * 1024 * 1024
 FIXED_ZIP_TIME = (1980, 1, 1, 0, 0, 0)
+EVIDENCE_SCHEMA_VERSION = 1
 
 ROOT_IGNORED_TREE_NAMES = {
     ".DS_Store",
@@ -112,6 +113,10 @@ class Layout:
     @property
     def checklist(self) -> Path:
         return self.root / "release" / "checklists" / f"{self.current}.md"
+
+    @property
+    def evidence(self) -> Path:
+        return self.root / "release" / "evidence" / f"{self.current}.json"
 
     def relative(self, path: Path) -> str:
         return path.relative_to(self.root).as_posix()
@@ -566,7 +571,7 @@ def _ignored(relative: Path) -> bool:
         return True
     if any(part in ANYWHERE_IGNORED_TREE_NAMES for part in relative.parts):
         return True
-    if relative.parts[0].endswith(".egg-info"):
+    if any(part.endswith(".egg-info") for part in relative.parts):
         return True
     if relative.name.startswith(".skillbump-") or relative.name == ".skillbump.release.lock":
         return True
@@ -582,6 +587,35 @@ def worktree_fingerprint(root: Path) -> str:
         if path.is_symlink():
             raise ReleaseError(f"worktree symlinks are not supported: {relative_path.as_posix()}")
         if _ignored(relative_path):
+            continue
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise ReleaseError(f"unsupported worktree entry: {relative_path.as_posix()}")
+        relative = _validate_path_text(relative_path.as_posix())
+        payload = path.read_bytes()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(stat.S_IMODE(path.stat().st_mode)).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(payload).digest())
+    return digest.hexdigest()
+
+
+def release_input_fingerprint(root: Path) -> str:
+    """Hash release inputs while excluding generated archives and evidence files."""
+
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        relative_path = path.relative_to(root)
+        if path.is_symlink():
+            raise ReleaseError(f"worktree symlinks are not supported: {relative_path.as_posix()}")
+        generated_release_output = (
+            len(relative_path.parts) >= 2
+            and relative_path.parts[0] == "release"
+            and relative_path.parts[1] in {"checklists", "evidence"}
+        )
+        if _ignored(relative_path) or generated_release_output:
             continue
         if path.is_dir():
             continue
@@ -713,27 +747,54 @@ def _run_checked(
     return {"argv": list(argv), "exit_code": completed.returncode, "output": output.strip()}
 
 
+def repository_check_plan(root: Path) -> list[dict[str, Any]]:
+    checks: list[dict[str, Any]] = []
+    validator = root / "scripts" / "validate_repo.py"
+    if validator.exists():
+        if validator.is_symlink() or not validator.is_file():
+            raise ReleaseError(f"repository validator must be a regular file: {validator}")
+        checks.append(
+            {
+                "id": "repository-validator",
+                "kind": "validation",
+                "argv": ["python", "-B", "scripts/validate_repo.py"],
+            }
+        )
+    tests = root / "tests"
+    if tests.exists():
+        if tests.is_symlink() or not tests.is_dir():
+            raise ReleaseError(f"repository tests must be a real directory: {tests}")
+        checks.append(
+            {
+                "id": "python-unittest",
+                "kind": "unit",
+                "argv": ["python", "-B", "-m", "unittest", "discover", "-s", "tests", "-v"],
+            }
+        )
+    return checks
+
+
 def run_repository_checks(root: Path, temp_root: Path) -> list[dict[str, Any]]:
     environment = _subprocess_environment(temp_root)
     results: list[dict[str, Any]] = []
-    validator = root / "scripts" / "validate_repo.py"
-    if validator.is_file() and not validator.is_symlink():
-        results.append(
-            _run_checked(
-                [sys.executable, "-B", "scripts/validate_repo.py"],
-                cwd=root,
-                environment=environment,
+    for check in repository_check_plan(root):
+        display_argv = list(check["argv"])
+        execution_argv = [sys.executable, *display_argv[1:]]
+        result = _run_checked(execution_argv, cwd=root, environment=environment)
+        if check["id"] == "python-unittest" and re.search(
+            r"(?m)^Ran 0 tests?\b", result["output"]
+        ):
+            raise ReleaseError(
+                "repository check failed: unittest discovery found zero tests"
             )
+        result.update(
+            {
+                "id": check["id"],
+                "kind": check["kind"],
+                "argv": display_argv,
+            }
         )
-    tests = root / "tests"
-    if tests.is_dir() and not tests.is_symlink():
-        results.append(
-            _run_checked(
-                [sys.executable, "-B", "-m", "unittest", "discover", "-s", "tests", "-v"],
-                cwd=root,
-                environment=environment,
-            )
-        )
+        results.append(result)
     return results
 
 
@@ -766,11 +827,7 @@ def plan(
         version_paths.append(layout.relative(layout.claude_manifest))
     if layout.claude_marketplace is not None:
         version_paths.append(layout.relative(layout.claude_marketplace))
-    checks: list[list[str]] = []
-    if (layout.root / "scripts" / "validate_repo.py").is_file():
-        checks.append(["python", "-B", "scripts/validate_repo.py"])
-    if (layout.root / "tests").is_dir():
-        checks.append(["python", "-B", "-m", "unittest", "discover", "-s", "tests", "-v"])
+    checks = repository_check_plan(layout.root)
     return {
         "command": "plan",
         "root": str(layout.root),
@@ -785,6 +842,8 @@ def plan(
         "archive": f"dist/{layout.name}-plugin-{target}.zip",
         "checklist": f"release/checklists/{target}.md",
         "repository_checks": checks,
+        "repository_checks_status": "configured" if checks else "not_configured",
+        "live_prepare_requires_limited_evidence_acceptance": not checks,
         "submission_sheet": (
             layout.relative(layout.submission_sheet) if layout.submission_sheet is not None else None
         ),
@@ -792,6 +851,188 @@ def plan(
         "will_commit": False,
         "will_push": False,
         "will_publish": False,
+    }
+
+
+def _repository_checks_status(*, run_checks: bool, planned: list[dict[str, Any]]) -> str:
+    if not run_checks:
+        return "skipped"
+    return "passed" if planned else "not_configured"
+
+
+def _release_evidence_document(
+    layout: Layout,
+    *,
+    release_input_sha256: str,
+    archive_sha256: str,
+    archive_size: int,
+    checks: list[dict[str, Any]],
+    checks_status: str,
+    limited_evidence_accepted: bool,
+) -> dict[str, Any]:
+    return {
+        "schema_version": EVIDENCE_SCHEMA_VERSION,
+        "skill": {"name": layout.name, "version": str(layout.current)},
+        "release_input_sha256": release_input_sha256,
+        "archive": {
+            "path": layout.relative(layout.archive),
+            "bytes": archive_size,
+            "sha256": archive_sha256,
+        },
+        "repository_checks": {
+            "status": checks_status,
+            "limited_evidence_accepted": limited_evidence_accepted,
+            "items": [
+                {
+                    "id": check["id"],
+                    "kind": check["kind"],
+                    "argv": check["argv"],
+                    "exit_code": check["exit_code"],
+                }
+                for check in checks
+            ],
+        },
+    }
+
+
+def _require_exact_keys(value: dict[str, Any], expected: set[str], *, label: str) -> None:
+    if set(value) != expected:
+        raise ReleaseError(
+            f"{label} has unexpected fields; expected {sorted(expected)}, got {sorted(value)}"
+        )
+
+
+def _verify_release_evidence(
+    layout: Layout, *, required: bool, allow_unaccepted_limited: bool = False
+) -> dict[str, Any] | None:
+    path = layout.evidence
+    if path.is_symlink():
+        raise ReleaseError(f"release evidence must be a regular file: {path}")
+    if not path.exists():
+        if required:
+            raise ReleaseError(f"release evidence is missing: {path}")
+        return None
+    evidence = load_json(path)
+    _require_exact_keys(
+        evidence,
+        {"schema_version", "skill", "release_input_sha256", "archive", "repository_checks"},
+        label="release evidence",
+    )
+    if (
+        type(evidence["schema_version"]) is not int
+        or evidence["schema_version"] != EVIDENCE_SCHEMA_VERSION
+    ):
+        raise ReleaseError(
+            f"unsupported release evidence schema: {evidence['schema_version']!r}"
+        )
+
+    skill = evidence["skill"]
+    if not isinstance(skill, dict):
+        raise ReleaseError("release evidence skill must be an object")
+    _require_exact_keys(skill, {"name", "version"}, label="release evidence skill")
+    if skill != {"name": layout.name, "version": str(layout.current)}:
+        raise ReleaseError("release evidence skill identity does not match the manifests")
+
+    release_input_sha256 = evidence["release_input_sha256"]
+    if not isinstance(release_input_sha256, str) or re.fullmatch(
+        r"[0-9a-f]{64}", release_input_sha256
+    ) is None:
+        raise ReleaseError("release evidence contains an invalid input SHA-256")
+    actual_input_sha256 = release_input_fingerprint(layout.root)
+    if release_input_sha256 != actual_input_sha256:
+        raise ReleaseError(
+            "release evidence is stale: release inputs changed after repository checks ran"
+        )
+
+    archive = evidence["archive"]
+    if not isinstance(archive, dict):
+        raise ReleaseError("release evidence archive must be an object")
+    _require_exact_keys(archive, {"path", "bytes", "sha256"}, label="release evidence archive")
+    if not isinstance(archive["path"], str):
+        raise ReleaseError("release evidence archive path must be a string")
+    if type(archive["bytes"]) is not int or archive["bytes"] < 0:
+        raise ReleaseError("release evidence archive bytes must be a non-negative integer")
+    if not isinstance(archive["sha256"], str) or re.fullmatch(
+        r"[0-9a-f]{64}", archive["sha256"]
+    ) is None:
+        raise ReleaseError("release evidence archive contains an invalid SHA-256")
+    actual_archive_sha256 = hashlib.sha256(layout.archive.read_bytes()).hexdigest()
+    if archive.get("path") != layout.relative(layout.archive):
+        raise ReleaseError("release evidence archive path does not match the release archive")
+    if archive.get("bytes") != layout.archive.stat().st_size:
+        raise ReleaseError("release evidence archive size does not match the release archive")
+    if archive.get("sha256") != actual_archive_sha256:
+        raise ReleaseError("release evidence archive SHA-256 does not match the release archive")
+
+    repository_checks = evidence["repository_checks"]
+    if not isinstance(repository_checks, dict):
+        raise ReleaseError("release evidence repository_checks must be an object")
+    _require_exact_keys(
+        repository_checks,
+        {"status", "limited_evidence_accepted", "items"},
+        label="release evidence repository_checks",
+    )
+    checks_status = repository_checks["status"]
+    if checks_status not in {"passed", "not_configured", "skipped"}:
+        raise ReleaseError(f"release evidence contains an invalid check status: {checks_status!r}")
+    accepted = repository_checks["limited_evidence_accepted"]
+    if not isinstance(accepted, bool):
+        raise ReleaseError("release evidence limited_evidence_accepted must be boolean")
+    items = repository_checks["items"]
+    if not isinstance(items, list):
+        raise ReleaseError("release evidence check items must be an array")
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ReleaseError(f"release evidence check item {index} must be an object")
+        _require_exact_keys(
+            item,
+            {"id", "kind", "argv", "exit_code"},
+            label=f"release evidence check item {index}",
+        )
+        if not isinstance(item["id"], str) or not item["id"]:
+            raise ReleaseError(f"release evidence check item {index} has an invalid id")
+        if not isinstance(item["kind"], str) or not item["kind"]:
+            raise ReleaseError(f"release evidence check item {index} has an invalid kind")
+        if (
+            not isinstance(item["argv"], list)
+            or not item["argv"]
+            or any(not isinstance(part, str) or not part for part in item["argv"])
+        ):
+            raise ReleaseError(f"release evidence check item {index} has invalid argv")
+        if type(item["exit_code"]) is not int or item["exit_code"] != 0:
+            raise ReleaseError(f"release evidence check item {index} did not pass")
+    planned_checks = repository_check_plan(layout.root)
+    expected_passed_items = [
+        {
+            "id": check["id"],
+            "kind": check["kind"],
+            "argv": check["argv"],
+            "exit_code": 0,
+        }
+        for check in planned_checks
+    ]
+    if checks_status == "passed" and not planned_checks:
+        raise ReleaseError("release evidence says checks passed but no named gates exist")
+    if checks_status == "passed" and items != expected_passed_items:
+        raise ReleaseError(
+            "release evidence check items do not match the repository's current named gates"
+        )
+    if checks_status == "not_configured" and planned_checks:
+        raise ReleaseError(
+            "release evidence says checks were not configured, but named gates now exist"
+        )
+    if checks_status != "passed" and items:
+        raise ReleaseError("release evidence records check results for a limited-evidence release")
+    if checks_status == "passed" and accepted:
+        raise ReleaseError("release evidence cannot accept limited evidence when checks passed")
+    if checks_status != "passed" and not accepted and not allow_unaccepted_limited:
+        raise ReleaseError("limited release evidence was not explicitly accepted")
+    return {
+        "path": layout.relative(path),
+        "release_input_sha256": release_input_sha256,
+        "repository_checks_status": checks_status,
+        "limited_evidence_accepted": accepted,
+        "items": items,
     }
 
 
@@ -803,6 +1044,9 @@ def _checklist_markdown(
     sha256: str,
     archive_size: int,
     checks: list[dict[str, Any]],
+    checks_status: str,
+    release_input_sha256: str,
+    limited_evidence_accepted: bool,
     openai_submission: str,
 ) -> str:
     version_targets = [layout.relative(layout.codex_manifest)]
@@ -821,6 +1065,9 @@ def _checklist_markdown(
         f"- Archive: `{layout.relative(layout.archive)}`",
         f"- Archive bytes: `{archive_size}`",
         f"- SHA-256: `{sha256}`",
+        f"- Release inputs SHA-256: `{release_input_sha256}`",
+        f"- Evidence record: `{layout.relative(layout.evidence)}`",
+        f"- Repository checks: `{checks_status}`",
         f"- OpenAI submission intent: `{openai_submission}`",
         "- Git commit, tag, push, store upload, review, and publish: not performed",
         "",
@@ -829,12 +1076,24 @@ def _checklist_markdown(
     ]
     lines.extend(f"- `{path}`" for path in sorted(version_targets))
     lines.extend(["", "Repository checks:", ""])
-    if checks:
+    if checks_status == "passed":
         lines.extend(
-            f"- PASS: `{' '.join(str(part) for part in check['argv'])}`" for check in checks
+            (
+                f"- PASS [{check['kind']}] `{check['id']}`: "
+                f"`{' '.join(str(part) for part in check['argv'])}`"
+            )
+            for check in checks
+        )
+    elif checks_status == "skipped":
+        lines.append(
+            "- SKIPPED BY USER: automated repository checks did not run; "
+            f"limited evidence explicitly accepted: `{str(limited_evidence_accepted).lower()}`."
         )
     else:
-        lines.append("- No standard repository validator or unit-test directory was found.")
+        lines.append(
+            "- NOT CONFIGURED: package integrity passed, but no automated repository "
+            "validator or test suite was found."
+        )
     lines.extend(
         [
             "",
@@ -845,6 +1104,8 @@ def _checklist_markdown(
             "## Author actions",
             "",
             "- [ ] Review the complete Git diff and ZIP member list.",
+            "- [ ] Confirm the checks cover one or two critical user journeys; "
+            "package integrity alone is not behavior evidence.",
             "- [ ] Cold-install and exercise the Claude package.",
             "- [ ] Cold-install and exercise the ChatGPT/Codex package.",
             "- [ ] Commit and push the reviewed release files.",
@@ -871,7 +1132,9 @@ def _stage_release(
     run_checks: bool,
     temp_root: Path,
     openai_submission: str,
-) -> tuple[Layout, list[dict[str, Any]], str]:
+    limited_evidence_accepted: bool,
+    allow_unaccepted_limited: bool,
+) -> tuple[Layout, list[dict[str, Any]], str, str, str]:
     layout = discover(stage_root)
     previous = layout.current
     _sync_canonical(layout)
@@ -894,6 +1157,10 @@ def _stage_release(
 
     staged = discover(stage_root)
     intended_fingerprint = worktree_fingerprint(stage_root)
+    planned_checks = repository_check_plan(stage_root)
+    checks_status = _repository_checks_status(
+        run_checks=run_checks, planned=planned_checks
+    )
     checks = run_repository_checks(stage_root, temp_root) if run_checks else []
     if worktree_fingerprint(stage_root) != intended_fingerprint:
         raise ReleaseError("repository checks modified release inputs; refusing to publish them")
@@ -904,6 +1171,18 @@ def _stage_release(
         staged.archive,
         repository_root=staged.root,
     )
+    release_input_sha256 = release_input_fingerprint(stage_root)
+    evidence = _release_evidence_document(
+        staged,
+        release_input_sha256=release_input_sha256,
+        archive_sha256=sha256,
+        archive_size=staged.archive.stat().st_size,
+        checks=checks,
+        checks_status=checks_status,
+        limited_evidence_accepted=limited_evidence_accepted,
+    )
+    staged.evidence.parent.mkdir(parents=True, exist_ok=True)
+    staged.evidence.write_bytes(json_bytes(evidence))
     checklist = _checklist_markdown(
         staged,
         previous=previous,
@@ -911,6 +1190,9 @@ def _stage_release(
         sha256=sha256,
         archive_size=staged.archive.stat().st_size,
         checks=checks,
+        checks_status=checks_status,
+        release_input_sha256=release_input_sha256,
+        limited_evidence_accepted=limited_evidence_accepted,
         openai_submission=openai_submission,
     )
     staged.checklist.parent.mkdir(parents=True, exist_ok=True)
@@ -920,7 +1202,12 @@ def _stage_release(
         require_archive=True,
         require_submission=openai_submission != "skip",
     )
-    return staged, checks, sha256
+    _verify_release_evidence(
+        staged,
+        required=True,
+        allow_unaccepted_limited=allow_unaccepted_limited,
+    )
+    return staged, checks, sha256, checks_status, release_input_sha256
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1541,6 +1828,7 @@ def _release_output_states(
     paths.extend(
         [
             layout.root / "dist" / f"{layout.name}-plugin-{target_version}.zip",
+            layout.root / "release" / "evidence" / f"{target_version}.json",
             layout.root / "release" / "checklists" / f"{target_version}.md",
         ]
     )
@@ -1739,6 +2027,7 @@ def _publish_outputs(
     file_pairs.extend(
         [
             (stage.archive, live.root / stage.archive.relative_to(stage.root)),
+            (stage.evidence, live.root / stage.evidence.relative_to(stage.root)),
             (stage.checklist, live.root / stage.checklist.relative_to(stage.root)),
         ]
     )
@@ -1916,6 +2205,7 @@ def prepare(
     dry_run: bool = False,
     run_checks: bool = True,
     openai_submission: str = "skip",
+    allow_limited_evidence: bool = False,
 ) -> dict[str, Any]:
     normalized_notes = _normalize_release_notes(notes)
     if openai_submission not in {"initial", "update", "skip"}:
@@ -1935,6 +2225,22 @@ def prepare(
         target = _target_version(live.current, bump, target_version)
         if openai_submission != "skip" and live.submission_sheet is None:
             raise ReleaseError("OpenAI submission was requested, but no submission sheet exists")
+        planned_checks = repository_check_plan(live.root)
+        anticipated_checks_status = _repository_checks_status(
+            run_checks=run_checks, planned=planned_checks
+        )
+        if (
+            not dry_run
+            and anticipated_checks_status != "passed"
+            and not allow_limited_evidence
+        ):
+            raise ReleaseError(
+                f"release evidence is limited ({anticipated_checks_status}); add a repository "
+                "validator/test suite, or explicitly pass --allow-limited-evidence"
+            )
+        limited_evidence_accepted = (
+            anticipated_checks_status != "passed" and allow_limited_evidence
+        )
         expected_states = _release_output_states(
             live,
             target_version=target,
@@ -1945,14 +2251,18 @@ def prepare(
             temp_root = Path(temporary)
             stage_root = temp_root / "repository"
             _copy_worktree(live.root, stage_root)
-            staged, checks, sha256 = _stage_release(
+            staged, checks, sha256, checks_status, release_input_sha256 = _stage_release(
                 stage_root,
                 target=target,
                 notes=normalized_notes,
                 run_checks=run_checks,
                 temp_root=temp_root,
                 openai_submission=openai_submission,
+                limited_evidence_accepted=limited_evidence_accepted,
+                allow_unaccepted_limited=dry_run,
             )
+            if checks_status != anticipated_checks_status:
+                raise ReleaseError("repository check configuration changed during preparation")
             if openai_submission == "update":
                 portal_step = "upload the ZIP as an update in the OpenAI plugin portal"
             elif openai_submission == "initial":
@@ -1970,9 +2280,21 @@ def prepare(
                 "archive_sha256": sha256,
                 "archive_bytes": staged.archive.stat().st_size,
                 "checklist": f"release/checklists/{target}.md",
+                "release_evidence": f"release/evidence/{target}.json",
+                "release_input_sha256": release_input_sha256,
+                "repository_checks_status": checks_status,
+                "limited_evidence": checks_status != "passed",
+                "limited_evidence_accepted": limited_evidence_accepted,
                 "openai_submission": openai_submission,
                 "checks": checks,
                 "next_steps": [
+                    *(
+                        [
+                            "add and run one or two critical-journey or calibrated eval checks"
+                        ]
+                        if checks_status != "passed"
+                        else []
+                    ),
                     "review the Git diff and cold-install both packages",
                     "commit and push the reviewed release",
                     portal_step,
@@ -2001,6 +2323,8 @@ def verify(root: str | os.PathLike[str]) -> dict[str, Any]:
     layout = discover(root)
     _verify_layout(layout, require_archive=True)
     sha256 = hashlib.sha256(layout.archive.read_bytes()).hexdigest()
+    evidence = _verify_release_evidence(layout, required=False)
+    checks_status = evidence["repository_checks_status"] if evidence else "missing"
     return {
         "command": "verify",
         "root": str(layout.root),
@@ -2009,6 +2333,15 @@ def verify(root: str | os.PathLike[str]) -> dict[str, Any]:
         "archive": layout.relative(layout.archive),
         "archive_sha256": sha256,
         "archive_bytes": layout.archive.stat().st_size,
+        "release_evidence": evidence["path"] if evidence else None,
+        "release_evidence_verified": evidence is not None,
+        "release_input_sha256": (
+            evidence["release_input_sha256"]
+            if evidence
+            else release_input_fingerprint(layout.root)
+        ),
+        "repository_checks_status": checks_status,
+        "limited_evidence": checks_status != "passed",
         "submission_sheet_ready": _submission_ready(layout),
         "verified": True,
     }

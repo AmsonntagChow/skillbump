@@ -12,9 +12,10 @@ formal release such as `1.0.0 → 1.0.1` in one transaction:
 3. bump every existing explicit version field;
 4. record release notes and, only for an explicit OpenAI `initial` or `update`
    submission, update the portal submission sheet;
-5. run the repository validator and unit tests in a temporary copy;
-6. build and byte-check a deterministic public ZIP; and
-7. write a reviewable release checklist with the ZIP SHA-256.
+5. show and run the repository's release gates in a temporary copy;
+6. build and byte-check a deterministic public ZIP;
+7. bind the check results to the exact release-input and ZIP SHA-256 values; and
+8. write a reviewable checklist plus machine-readable evidence record.
 
 It deliberately does **not** commit, tag, push, upload, submit, or publish.
 
@@ -29,7 +30,7 @@ zero-padded forms such as `1.01`.
 Python 3.11 or newer is required on macOS, Linux, or WSL.
 
 ```bash
-python -m pip install -e /path/to/skillbump
+python -m pip install /path/to/skillbump
 
 # Read-only plan. Patch is the default.
 skillbump -C /path/to/my-skill-repo plan
@@ -57,6 +58,11 @@ Use `--bump minor` or `--bump major` instead of `--to` when appropriate.
 `skip`. Choose `initial` only for a plugin that has no existing directory
 listing, and choose `update` only after confirming the existing listing.
 
+If neither `scripts/validate_repo.py` nor `tests/` exists, a dry run reports
+limited evidence and a live release stops. `--allow-limited-evidence` is an
+explicit escape hatch for a package-only release; the limitation is written to
+the evidence record and checklist. `--skip-repo-checks` has the same requirement.
+
 ## Supported repository layout
 
 SkillBump intentionally supports one convention instead of guessing arbitrary
@@ -74,6 +80,7 @@ plugins/<name>/
 submission/PLUGIN_DIRECTORY.md      # optional; changed only for initial/update
 scripts/validate_repo.py            # optional standard repository check
 tests/                              # optional unittest discovery
+release/evidence/<version>.json     # generated, evidence bound to release inputs
 ```
 
 A root-level `.codex-plugin/plugin.json` is also supported when the repository
@@ -99,6 +106,7 @@ skillbump [-C REPO] [--json] prepare
   [--openai-submission initial|update|skip]
   [--dry-run]
   [--skip-repo-checks]
+  [--allow-limited-evidence]
 
 skillbump [-C REPO] [--json] verify
 ```
@@ -109,22 +117,45 @@ skillbump [-C REPO] [--json] verify
   release there.
 - `prepare` repeats that flow, confirms the live inputs did not change, then
   transactionally publishes only the version files, packaged Skill, ZIP,
-  checklist, and the submission sheet when `initial` or `update` was selected.
-- `verify` checks version agreement, canonical/package equality, and every ZIP
-  member byte, then reports OpenAI submission readiness when applicable. It
-  does not treat a submission filename as an unconditional release invariant.
+  evidence record, checklist, and the submission sheet when `initial` or
+  `update` was selected.
+- `verify` checks version agreement, canonical/package equality, every ZIP
+  member byte, and—when present—the release evidence against the current input
+  bytes. It reports missing evidence honestly rather than treating package
+  integrity as proof of behavior.
 
-The repository checks are deliberately narrow and shell-free:
+The built-in repository gate adapters are deliberately narrow and shell-free:
 
 ```text
 python -B scripts/validate_repo.py
 python -B -m unittest discover -s tests -v
 ```
 
-They run only when those conventional paths exist. SkillBump removes common
-credential variables from their environment and rejects any check that changes
-release inputs. These are still repository-owned programs, not sandboxed
-untrusted code; inspect them before running a release.
+They run only when those conventional paths exist, and `plan` prints both exact
+commands before execution. SkillBump removes common credential variables from
+their environment and rejects any check that changes release inputs. These are
+still repository-owned programs, not sandboxed untrusted code; inspect them
+before running a release.
+
+## From a correct ZIP to behavioral evidence
+
+A synchronized, reproducible ZIP proves packaging integrity. It does not prove
+that a Skill still triggers, chooses the right workflow, or gives the right
+answer. Put one or two critical user journeys into `scripts/validate_repo.py`
+or `tests/` so the same gate runs locally and in CI before a release.
+
+For deterministic behavior, use exact assertions. For LLM or Agent behavior,
+wrap a small golden-set eval in one of those two adapters and make the command
+exit nonzero when its calibrated threshold fails. If an LLM judge is genuinely
+needed, calibrate it against held-out human labels and tolerate measured
+variance; do not turn wording equality into a fake deterministic test.
+
+Each successful live preparation writes
+`release/evidence/<version>.json`. It records only the Skill identity, release
+input SHA-256, ZIP path/size/SHA-256, named checks, and exit codes—no stdout,
+timestamps, or secrets. `verify` recomputes those values, so changing a Skill,
+manifest, validator, or test after the run makes the evidence stale. This is a
+local reproducibility record, not a signed provenance attestation.
 
 ## What happens in each store
 
@@ -202,6 +233,10 @@ and [local plugin update reference](https://github.com/openai/codex/blob/main/co
 - Plugin and worktree symlinks are rejected.
 - Release checks run in a temporary copy with no shell expansion and a reduced
   environment.
+- A live release with missing or deliberately skipped checks requires explicit
+  limited-evidence acceptance and is labeled as such.
+- The evidence record binds passed checks to the exact non-generated repository
+  inputs and archive bytes; later input edits make `verify` fail as stale.
 - A fingerprint prevents a concurrent live edit from being overwritten.
 - Live output replacement is rollback-protected.
 - ZIP entries are sorted, timestamped deterministically, path-normalized,
@@ -212,10 +247,11 @@ and [local plugin update reference](https://github.com/openai/codex/blob/main/co
 ## Agent Skill
 
 [`skills/skillbump`](skills/skillbump) is a companion Agent Skill for Codex and
-Claude-compatible hosts. It resolves the intended bump, release notes, and
-OpenAI submission intent, runs the plan/dry-run/prepare/verify loop, and
-explains the manual store boundary. The Python harness enforces the release
-mechanics; the Skill makes the workflow conversational.
+Claude-compatible hosts. It resolves the intended bump, release notes, OpenAI
+submission intent, and acceptable evidence level; runs the
+plan/dry-run/prepare/verify loop; and explains the manual store boundary. The
+Python harness enforces the release mechanics and evidence state; the Skill
+makes the workflow conversational.
 
 ## License
 

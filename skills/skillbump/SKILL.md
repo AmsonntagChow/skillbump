@@ -1,6 +1,6 @@
 ---
 name: skillbump
-description: Prepare a formal release of an Agent Skill or skills-only plugin owned by the user after its contents change. Use when an author asks to bump a Skill/plugin version such as 1.0.0 to 1.0.1, synchronize Claude Code and ChatGPT/Codex manifests, rebuild the public ZIP, update release notes, verify a release package, or ask how their updated Skill reaches either plugin marketplace. Do not use to pull an official upstream Skill, install someone else's Skill, review Skill quality, or publish without explicit authority.
+description: Prepare an evidence-bound formal release of an Agent Skill or skills-only plugin owned by the user after its contents change. Use when an author asks to bump a Skill/plugin version such as 1.0.0 to 1.0.1, synchronize Claude Code and ChatGPT/Codex manifests, rebuild the public ZIP, update release notes, verify a release package and its test evidence, or ask how their updated Skill reaches either plugin marketplace. Do not use to pull an official upstream Skill, install someone else's Skill, review Skill quality, or publish without explicit authority.
 ---
 
 # SkillBump
@@ -13,17 +13,26 @@ Before running commands, confirm that the `skillbump` executable is installed fr
 
 Confirm that the user owns or maintains the target repository. Locate its root and make sure it contains the standard canonical Skill and Codex plugin package expected by SkillBump.
 
-Before mutation, establish three facts that materially affect the release:
+Before mutation, establish four facts that materially affect the release:
 
 1. the bump level or explicit target version;
 2. release notes that accurately state what changed;
-3. the OpenAI submission intent: `initial`, `update`, or `skip`.
+3. the OpenAI submission intent: `initial`, `update`, or `skip`;
+4. the release evidence expected for the change.
 
 Do not ask again when the user already supplied a fact. Default the OpenAI intent to `skip` when the user did not request portal preparation. If the user requests OpenAI submission work but has not said whether this is the first listing or an update to an existing one, ask; never infer portal state from a Git version. If the user says `1.01`, explain briefly that the valid semantic version is `1.0.1` and use `1.0.1` only when that is clearly the intended patch release.
 
 Use `initial` only when no same-name listing exists in the OpenAI directory. Use `update` only after the user confirms an existing listing; preserve its plugin `name`, use a different valid SemVer, and describe what changed. Use `skip` for a release that should not alter the OpenAI submission sheet.
 
 Use patch for backwards-compatible fixes or refinements, minor for backwards-compatible new capability, and major for a breaking contract. Do not infer a major or minor release from file count alone.
+
+## Establish the release gate
+
+Packaging integrity is not behavior evidence. Inspect `scripts/validate_repo.py` and `tests/` and identify the one or two critical user journeys that could regress. For a Skill, this normally includes triggering on a realistic prompt and producing the important decision or action—not exact prose.
+
+Use deterministic assertions for deterministic requirements. For LLM or Agent behavior, use a small golden set whose runner exits nonzero below a stated threshold. Use an LLM judge only when deterministic checks are inadequate, and only after it has been calibrated against held-out human labels with an explicit variance policy. Do not prescribe a particular eval vendor; connect the repository's trusted eval runner through the standard validator or unittest suite.
+
+If the repository has no automated check, state plainly that only package integrity can be proven. Do not silently substitute a manual glance for a release gate.
 
 ## Inspect without changing anything
 
@@ -46,7 +55,8 @@ Review the plan for:
 - every existing Claude and Codex version target;
 - canonical-to-packaged Skill drift;
 - the future ZIP and checklist paths;
-- which repository validator and unit tests will run.
+- which named repository gates will run and their exact commands;
+- whether live preparation would require explicit limited-evidence acceptance.
 
 The Codex marketplace file `.agents/plugins/marketplace.json` normally has no plugin release version. Never add one merely to make all files look symmetrical.
 
@@ -67,7 +77,7 @@ skillbump -C <repo> prepare \
 
 The harness copies the author's current worktree, synchronizes the Skill, bumps versions, conditionally updates the submission sheet for `initial` or `update`, runs conventional repository checks, builds the ZIP, and verifies every archive byte without modifying the live repository. With `skip`, keep the submission sheet unchanged.
 
-Treat a failed validator or test as a release blocker. Do not bypass it by editing the generated archive, weakening a check, or using `--skip-repo-checks` unless the user explicitly accepts that narrower evidence and has another trusted validation path.
+Treat a failed validator or test as a release blocker. Read `repository_checks_status` rather than inferring success from ZIP creation. If it is `not_configured` or `skipped`, stop before live preparation and either add a critical-journey gate or obtain the user's explicit acceptance of a package-only release. Only then may the live command include `--allow-limited-evidence`. Never add that flag by default, and never hide `--skip-repo-checks` as though no checks existed.
 
 ## Prepare the local release
 
@@ -87,12 +97,14 @@ Then run:
 skillbump -C <repo> verify
 ```
 
-Inspect the full Git diff, the generated `release/checklists/<version>.md`, the ZIP member list, and its SHA-256. Confirm that:
+Inspect the full Git diff, `release/evidence/<version>.json`, the generated `release/checklists/<version>.md`, the ZIP member list, and its SHA-256. Confirm that:
 
 - all existing explicit manifests contain exactly the target version;
 - the canonical and packaged Skill copies match;
 - the ZIP is rooted directly at `.codex-plugin/`, `assets/`, and `skills/` rather than an extra wrapper directory;
 - the readiness report matches the chosen OpenAI submission intent; for `initial` or `update`, the notes use that exact status, while `skip` leaves the submission sheet unchanged;
+- the evidence record reports `passed`, or clearly records the user's explicit limited-evidence acceptance;
+- the release-input SHA-256 still verifies, so the Skill, manifests, validator, and tests have not changed since the gates ran;
 - no unrelated user change was overwritten.
 
 ## Respect publishing boundaries
@@ -128,7 +140,8 @@ For local cache testing, work from a disposable local copy, give its manifest a 
 
 Lead with the concrete release state:
 
-- `PREPARED`: local manifests, package, tests, ZIP, and checklist passed;
+- `PREPARED`: local manifests, named repository gates, evidence record, ZIP, and checklist passed;
+- `PREPARED WITH LIMITED EVIDENCE`: use only when the user explicitly accepted missing or skipped repository checks;
 - `DRY RUN ONLY`: proof passed but the live worktree is unchanged;
 - `BLOCKED`: state the single blocking mismatch or failed check;
 - `PUBLISHED`: use only after the relevant store itself confirms publication.

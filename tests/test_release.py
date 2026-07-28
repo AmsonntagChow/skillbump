@@ -142,6 +142,11 @@ class PlanTests(unittest.TestCase):
             self.assertEqual(result["current_version"], "1.0.0")
             self.assertEqual(result["target_version"], "1.0.1")
             self.assertIn("update SKILL.md", result["sync_changes"])
+            self.assertEqual(result["repository_checks_status"], "configured")
+            self.assertEqual(
+                [check["kind"] for check in result["repository_checks"]],
+                ["validation", "unit"],
+            )
             self.assertEqual(visible_snapshot(root), before)
 
     def test_manifest_mismatch_fails(self) -> None:
@@ -205,7 +210,14 @@ class PrepareTests(unittest.TestCase):
             self.assertIn("demo-skill-plugin-1.0.1.zip", sheet)
             self.assertIn("Version 1.0.1 update. Improves evidence rules.", sheet)
             self.assertTrue((root / "release" / "checklists" / "1.0.1.md").is_file())
-            self.assertTrue(verify(root)["verified"])
+            evidence_path = root / "release" / "evidence" / "1.0.1.json"
+            self.assertTrue(evidence_path.is_file())
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            self.assertEqual(evidence["repository_checks"]["status"], "passed")
+            verified = verify(root)
+            self.assertTrue(verified["verified"])
+            self.assertTrue(verified["release_evidence_verified"])
+            self.assertEqual(verified["repository_checks_status"], "passed")
 
     def test_initial_submission_is_not_mislabeled_as_update(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -243,6 +255,149 @@ class PrepareTests(unittest.TestCase):
             with self.assertRaisesRegex(ReleaseError, "repository check failed"):
                 prepare(root, notes="A release that must fail.")
             self.assertEqual(visible_snapshot(root), before)
+
+    def test_empty_test_directory_is_not_a_passing_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_repository(root)
+            (root / "tests" / "test_smoke.py").unlink()
+            before = visible_snapshot(root)
+
+            with self.assertRaisesRegex(ReleaseError, "Ran 0 tests|found zero tests"):
+                prepare(root, notes="Zero tests must not look green.")
+
+            self.assertEqual(visible_snapshot(root), before)
+
+    def test_dry_run_reports_missing_checks_without_mutating_live_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_repository(root)
+            shutil.rmtree(root / "scripts")
+            shutil.rmtree(root / "tests")
+            before = visible_snapshot(root)
+
+            result = prepare(root, notes="Package-only proof.", dry_run=True)
+
+            self.assertTrue(result["dry_run"])
+            self.assertEqual(result["repository_checks_status"], "not_configured")
+            self.assertTrue(result["limited_evidence"])
+            self.assertFalse(result["limited_evidence_accepted"])
+            self.assertEqual(visible_snapshot(root), before)
+
+    def test_live_prepare_requires_explicit_acceptance_for_limited_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_repository(root)
+            shutil.rmtree(root / "scripts")
+            shutil.rmtree(root / "tests")
+            before = visible_snapshot(root)
+
+            with self.assertRaisesRegex(ReleaseError, "--allow-limited-evidence"):
+                prepare(root, notes="Package-only proof.")
+
+            self.assertEqual(visible_snapshot(root), before)
+
+    def test_explicit_limited_evidence_is_recorded_and_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_repository(root)
+            shutil.rmtree(root / "scripts")
+            shutil.rmtree(root / "tests")
+
+            result = prepare(
+                root,
+                notes="Explicit package-only release.",
+                allow_limited_evidence=True,
+            )
+
+            self.assertEqual(result["repository_checks_status"], "not_configured")
+            self.assertTrue(result["limited_evidence_accepted"])
+            checklist = (root / result["checklist"]).read_text(encoding="utf-8")
+            self.assertIn("NOT CONFIGURED", checklist)
+            verified = verify(root)
+            self.assertTrue(verified["release_evidence_verified"])
+            self.assertTrue(verified["limited_evidence"])
+
+    def test_skipped_checks_are_not_mislabeled_as_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_repository(root)
+
+            result = prepare(
+                root,
+                notes="Checks explicitly skipped.",
+                run_checks=False,
+                allow_limited_evidence=True,
+            )
+
+            self.assertEqual(result["repository_checks_status"], "skipped")
+            checklist = (root / result["checklist"]).read_text(encoding="utf-8")
+            self.assertIn("SKIPPED BY USER", checklist)
+
+    def test_verify_rejects_evidence_after_test_inputs_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_repository(root)
+            prepare(root, notes="Evidence-bound release.")
+            test_path = root / "tests" / "test_smoke.py"
+            test_path.write_text(
+                test_path.read_text(encoding="utf-8") + "\n# changed after release\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ReleaseError, "release evidence is stale"):
+                verify(root)
+
+    def test_verify_rejects_fabricated_named_check(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_repository(root)
+            result = prepare(root, notes="Evidence-bound release.")
+            evidence_path = root / result["release_evidence"]
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            evidence["repository_checks"]["items"] = [
+                {
+                    "id": "fabricated-e2e",
+                    "kind": "e2e",
+                    "argv": ["true"],
+                    "exit_code": 0,
+                }
+            ]
+            write_json(evidence_path, evidence)
+
+            with self.assertRaisesRegex(ReleaseError, "current named gates"):
+                verify(root)
+
+    def test_generated_nested_egg_info_does_not_stale_release_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_repository(root)
+            prepare(root, notes="Evidence-bound release.")
+            metadata = root / "src" / "demo_skill.egg-info"
+            metadata.mkdir(parents=True)
+            (metadata / "PKG-INFO").write_text("generated metadata\n", encoding="utf-8")
+
+            self.assertTrue(verify(root)["release_evidence_verified"])
+
+    def test_limited_evidence_cannot_be_relabelled_as_empty_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_repository(root)
+            shutil.rmtree(root / "scripts")
+            shutil.rmtree(root / "tests")
+            result = prepare(
+                root,
+                notes="Explicit package-only release.",
+                allow_limited_evidence=True,
+            )
+            evidence_path = root / result["release_evidence"]
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            evidence["repository_checks"]["status"] = "passed"
+            evidence["repository_checks"]["limited_evidence_accepted"] = False
+            write_json(evidence_path, evidence)
+
+            with self.assertRaisesRegex(ReleaseError, "no named gates exist"):
+                verify(root)
 
     def test_repository_check_cannot_smuggle_an_input_change(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

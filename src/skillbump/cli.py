@@ -80,6 +80,14 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip scripts/validate_repo.py and unit tests (built-in checks still run)",
     )
+    prepare_parser.add_argument(
+        "--allow-limited-evidence",
+        action="store_true",
+        help=(
+            "permit a live release when repository checks are absent or explicitly skipped; "
+            "the limitation is recorded in release evidence"
+        ),
+    )
 
     subparsers.add_parser("verify", help="verify synchronized manifests, Skill copy, and ZIP")
     return parser
@@ -111,17 +119,47 @@ def _print_plan(result: dict[str, Any]) -> None:
         print("Canonical and packaged Skill already match.")
     print(f"Archive: {result['archive']}")
     print(f"Checklist: {result['checklist']}")
+    checks = result["repository_checks"]
+    if checks:
+        print("Repository release gates:")
+        for check in checks:
+            print(
+                f"  - [{check['kind']}] {check['id']}: "
+                f"{' '.join(check['argv'])}"
+            )
+    else:
+        print(
+            "Repository release gates: NOT CONFIGURED "
+            "(live prepare requires --allow-limited-evidence)"
+        )
     print(f"OpenAI submission sheet: {result['openai_submission']}")
     print("No commit, push, store upload, or publish action will be performed.")
 
 
 def _print_prepared(result: dict[str, Any]) -> None:
-    prefix = "Dry run passed" if result["dry_run"] else "Release prepared"
+    if result["dry_run"]:
+        prefix = (
+            "Dry run passed"
+            if not result["limited_evidence"]
+            else "Dry run completed with limited evidence"
+        )
+    else:
+        prefix = (
+            "Release prepared"
+            if not result["limited_evidence"]
+            else "Package prepared with explicitly accepted limited evidence"
+        )
     print(f"{prefix}: {result['name']} {result['previous_version']} -> {result['version']}")
     for check in result["checks"]:
-        print(f"PASS: {' '.join(check['argv'])}")
+        print(f"PASS [{check['kind']}] {check['id']}: {' '.join(check['argv'])}")
+    if result["repository_checks_status"] == "not_configured":
+        print("Repository checks: NOT CONFIGURED")
+    elif result["repository_checks_status"] == "skipped":
+        print("Repository checks: SKIPPED BY USER")
     print(f"Archive: {result['archive']}")
     print(f"SHA-256: {result['archive_sha256']}")
+    print(f"Release inputs SHA-256: {result['release_input_sha256']}")
+    print(f"Evidence: {result['release_evidence']}")
     print(f"Checklist: {result['checklist']}")
     print(f"OpenAI submission sheet: {result['openai_submission']}")
     if result["dry_run"]:
@@ -131,7 +169,13 @@ def _print_prepared(result: dict[str, Any]) -> None:
 
 
 def _print_verified(result: dict[str, Any]) -> None:
-    print(f"Verified {result['name']} {result['version']}")
+    if result["release_evidence_verified"] and not result["limited_evidence"]:
+        prefix = "Package and evidence bindings verified"
+    elif result["release_evidence_verified"]:
+        prefix = "Package verified with limited release evidence"
+    else:
+        prefix = "Package verified; release evidence record is missing"
+    print(f"{prefix}: {result['name']} {result['version']}")
     print(f"Archive: {result['archive']}")
     print(f"SHA-256: {result['archive_sha256']}")
 
@@ -157,6 +201,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 dry_run=args.dry_run,
                 run_checks=not args.skip_repo_checks,
                 openai_submission=args.openai_submission,
+                allow_limited_evidence=args.allow_limited_evidence,
             )
         else:
             result = verify(args.repo)

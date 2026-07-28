@@ -1,4 +1,4 @@
 interface:
   display_name: "SkillBump"
-  short_description: "Turn Skill edits into a verified release"
-  default_prompt: "Use $skillbump to prepare my updated Agent Skill as the next verified Claude and ChatGPT/Codex plugin release."
+  short_description: "Turn Skill edits into an evidence-bound release"
+  default_prompt: "Use $skillbump to prepare my updated Agent Skill as the next evidence-bound Claude and ChatGPT/Codex plugin release."

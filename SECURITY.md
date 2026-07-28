@@ -24,7 +24,19 @@ They run in a temporary copy with a reduced environment and without shell
 parsing. That is not an operating-system sandbox: a malicious test or validator
 could still access the machine using the author's user permissions. Review
 repository code before running a release, or use `--skip-repo-checks` and run
-trusted checks separately in an appropriate sandbox.
+trusted checks separately in an appropriate sandbox. A live release with
+missing or skipped checks requires `--allow-limited-evidence`, and both the
+checklist and evidence JSON preserve that decision as a limitation.
+
+SkillBump does not auto-discover package-manager scripts or execute commands
+from a repository-defined release manifest. Adding an arbitrary-command DSL
+would materially expand the surprise execution surface; trusted E2E or eval
+runners should be invoked by one of the two visible conventional adapters.
+
+The generated evidence JSON binds named check results to a deterministic digest
+of non-generated repository inputs and to the ZIP bytes. It intentionally omits
+stdout and environment data. It is a local consistency record, not a signed
+attestation and not proof that an untested behavior is correct.
 
 The release transaction acquires a repository-scoped lock before reading the
 current version, fingerprints the live worktree, prepares and verifies outputs
