@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skillbump"
+version = "0.1.0"
+description = "Author-side release harness for Agent Skill plugins"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "AmsonntagChow" }]
+dependencies = []
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+
+[project.urls]
+Homepage = "https://github.com/AmsonntagChow/skillbump"
+Issues = "https://github.com/AmsonntagChow/skillbump/issues"
+
+[project.scripts]
+skillbump = "skillbump.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
